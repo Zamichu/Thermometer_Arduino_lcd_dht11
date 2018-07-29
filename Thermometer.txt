@@ -1,0 +1,328 @@
+//Kirjastot
+#include <LiquidCrystal.h> //Tuodaan LCD nayton kirjasto
+#include <SimpleDHT.h> //tuodaan lämpötila ja kosteus tunnistimen kirjasto
+
+//Fyysiset määritykset
+int pinDHT11 = 7; //Anturin data pinni
+SimpleDHT11 dht11; //Kerrotaan kirjastolle anturin tyyppi dht11 tai dht22
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2); //LCD näytön pinnit arduinossa (RS,E,D4,D5,D6,D7)
+
+// Globaalit muuttujat
+char cLine0Buffer[17]; //Näytön ohjauksen muisti riville 0
+char cLine1Buffer[17]; //Näytön ohjauksen muisti riville 1
+
+int selval; //Luodaan muuttuja selval jolla kutsutaan max/min lämpötila näyttöä
+int selval2; //Luodaan apumuuttuja PWM pakko-ohjauksen käyttöön keskeytyksissä.
+int selval3; //Luodaan apumuuttuja joka estää resetoinnin max/min näytössä. käytetään case 0 ja PCINT1 (keskeytys 1)
+
+//Lämpötila muuttujat
+byte temperature; //Alustetaan muuttuja temperature
+byte humidity; //Alustetaan muuttuja humidity
+unsigned int tmax; //Luodaan muuttuja tmax lämpötilan maksimi arvolle
+int tmaxH; //Luodaan muuttuja tmaxH 16 bittisen tmax lämpötila-arvon korkeammalle tavulle 
+int tmaxL; //Luodaan muuttuja tmaxL 16 bittisen tmax lämpötila-arvon alemmaalle tavulle
+unsigned int tmin; //Luodaan muuttuja tmin lämpötilan minimi arvolle
+int tminH; // Luodaan muuttuja tminH 16 bittisen tmin lämpötila-arvon korkeammalle tavulle
+int tminL; // Luodaan muuttuja tminL 16 bittisen tmin lämpötila-arvon alemmalle tavulle
+unsigned int hmax; //Luodaan muuttuja hmax kosteuden maksimi arvolle
+int hmaxH; //Luodaan muuttuja hmaxH 16 bittisen hmax kosteus-arvon korkeammalle tavulle
+int hmaxL; //Luodaan muuttuja hmaxL 16 bittisen hmax kosteus-arvon alemmalle tavulle
+unsigned int hmin; //Luodaan muuttuja hmin kosteuden minimi arvolle
+int hminH; //Luodaan muuttuja hminH 16 bittisen hmin kosteus-arvon korkeammalle tavulle
+int hminL; //Luodaan muuttuja hminL 16 bittisen hmin kosteus-arvon alemmalle tavulle
+
+//PWM muuttujat
+int pwmval; //Luodaan muuttuja pwmval PWM ohjaukselle.
+int pwmon; //Luodaan muuttuja PWM pakko-ohjaukseen.
+int pwmpros; //Luodaan muuttuja PWM prosentti arvon näyttämistä varten.
+
+
+// Interrupt routines
+
+ISR(PCINT0_vect) //Keskeytys vektori jolla kutsutaan max/min näyttö ja aktivoidaan PWM pakko-ohjaus optio.
+{
+  selval = 1; //Muutetaan selval arvoon 1 jolla vaikutetaan switch/case funktioon
+  selval2 = 1; // Asetetaan selval2 apumuuttuja arvoon 1, tämä muutetaan PCINT1:ssä arvoon 0 jos PWM ohjauksen tilaa on muutettu.
+  selval3 = 0; //Asetetaan selval3 apumuuttuja arvoon 0, tämä estää lämpötilojen resetoinnin max/min näytössä.
+  delay(300); // 0,3s viive joka estää tila muutoksen "pomppimisen"
+}
+
+ISR(PCINT1_vect) //keskeytys vektori jolla resetoidaan min ja max arvot ja käynnistetään PWM pakko-ohjaus.
+{
+    if (selval2 == 1) //Tarkistetaan onko selval2 arvossa 1 jolloin max/min näyttö on kutsuttu
+    {
+     switch (pwmon) //Tarkistetaan pwmon muutujan tila
+     {
+      case 0: //Jos pwmon on arvolla 0
+      pwmon = 1; //asetetaan pwmon arvoon 1
+      selval2 = 0; //asetetaan selval2 arvoon 0 jolloin seuraava muutos vaatii uuden PCINT0(max/min näyttö) kutsun.
+      break; //Palataan ohjelmaan.
+
+      case 1: //Jos pwmon on arvolla 1
+      pwmon = 0; //asetetaan pwmon arvoon 0
+      selval2 = 0; //asetetaan selval2 arvoon 0 jolloin seuraava muutos vaatii uuden PCINT0(max/min näyttö) kutsun.
+      break; //Palataan ohjelmaan.
+     }
+     
+    }
+    
+    else
+    {
+    if (selval3 == 1) //Tarkistetaan muutujan selval3 tila, tämä on 1 jos lämpötilanäyttö on käytössä tällöin RESET on mahdollinen.
+      {
+      tmax=temperature; //asetetaan tmax edelliseen temperature arvoon
+      hmax=humidity; //asetetaan hmax edelliseen humidity arvoon
+      hmin=humidity; //asetetaan hmin edelliseen humidity arvoon
+      tmin=temperature; //asetetaan tmin edelliseen temperature arvoon
+      }
+    }
+    _delay_ms(300); //0,3s viive.
+     
+}
+
+void setup() {
+  
+  
+  
+  Serial.begin(115200); //Käynnistetään sarjayhteys monitorointiin nopeudella 115200baud
+  
+  lcd.begin(16, 2); //määritellään näytön parametrit 16 merkkiä ja 2 riviä
+  
+  
+  // I/O init 
+
+  DDRB |= 0x02; //Asetetaan PD1 PWM ulostuloksi. Levyllä Pin9.
+  
+  PORTB |= 0x01; //ylösvetovastus napille pin 8
+  PORTC |= 0x01; //ylösvetovastus napille pin A0
+  
+  SREG = SREG | 0x80; //aktivoidaan keskeytykset
+
+  PCICR |= 0x03; //Aktivoidaan PCMSK0, PCMSK1 ja PCMSK2 keskeytys vektorit
+  PCMSK0 |= 0x01; //Määritetään PCMSK0 aktivointi pinniksi PB0/PCINT0 joka on levyllä pin8. Tällä kutsutaan max/min näyttö sekä mahdollistetaan PWM pakko-ohjaus
+  PCMSK1 |= 0x01; //Määritetään PCMSK1 aktivointi pinniksi PC0/PCINT8 joka on levyllä pin A0. Tällä resetoidaan max/min arvot sekä ohjataan pwmon tilaa
+ 
+  // lämpötilan max ja min arvojen palautus eeprom muistista
+
+  EEAR = 0x01; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  tmaxH = EEDR; //Palautetaan EEDR datarekisteristä arvo tmaxH muuttujaksi.
+
+  EEAR = 0x02; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  tmaxL = EEDR; //Palautetaan EEDR datarekisteristä arvo tmaxL muuttujaksi.
+  
+  EEAR = 0x03; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  tminH = EEDR; //Palautetaan EEDR datarekisteristä arvo tminH muuttujaksi.
+
+  EEAR = 0x04; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  tminL = EEDR; //Palautetaan EEDR datarekisteristä arvo tminL muuttujaksi.
+  
+  tmax = (tmaxH << 8)+tmaxL; //Muodostetaan tmaxH ja tmaxL muuttujista tmax arvo
+  tmin = (tminH << 8)+tminL; //Muodostetaan tminH ja tminL muuttujista tmin arvo
+
+  // kosteuden max ja min arvojen palautus eeprom muistista
+
+  EEAR = 0x05; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  hmaxH = EEDR; //Palautetaan EEDR datarekisteristä arvo tmaxH muuttujaksi.
+
+  EEAR = 0x06; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  hmaxL = EEDR; //Palautetaan EEDR datarekisteristä arvo tmaxL muuttujaksi.
+
+  EEAR = 0x07; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  hminH = EEDR; //Palautetaan EEDR datarekisteristä arvo tminH muuttujaksi.
+
+  EEAR = 0x08; //Valitaan eeprom osoite
+  EECR |= (1<<EERE); //Käynnistetään lukutoiminto kirjoittamalla EECR rekisteriin bittisiirrolla Arvo EERE (bit0) ykköseksi.
+  hminL = EEDR; //Palautetaan EEDR datarekisteristä arvo tminL muuttujaksi.
+  
+  //Tulostuksessa käytettävien muuttujien (16bit) muodostus kahdesta 8bit muuttujasta.
+  hmax = (hmaxH << 8)+hmaxL; //Muodostetaan tmaxH ja tmaxL muuttujista tmax arvo
+  hmin = (hminH << 8)+hminL; //Muodostetaan tminH ja tminL muuttujista tmin arvo
+
+  
+  delay(2000); //2sekunnin viive käynnistyksessä.
+}
+
+void loop() {
+  
+  
+  switch (selval) //valitaan max/min näyttö jos pyyntö (selval) on aktivoitu keskeytyksestä
+  {
+  case 0: //mikälis selval on 0 niin näytetään lämpötiedot
+
+      selval3 = 1; //Lämpötila resetin apumuuttuja, kun tämä on arvossa 1 on resettoiminto mahdollinen
+      
+      
+      
+      delay(500); //0.5s viive
+      
+      dht11.read(pinDHT11, &temperature, &humidity, NULL); //luetaan lämpötila ja kosteus arvo anturilta muuttujiksi temperature ja humidity
+
+      
+      //Max/Min vertailu
+      if (humidity >= hmax) //jos kosteusarvo on suurempi kuin hmax arvo
+      {
+       hmax = humidity; //tallennetaan hmax arvoksi humidity arvo
+       //Puretaan 16-bittinen kosteus viesti kahdeksi 8-bitin tavuksi
+       //datahmax (hmax)
+       int datahmax =  hmax; //alustetaan muuttuja data2 ja annetaan sinne arvo tmax
+       byte Hihmax = datahmax >> 8; //alustetaan byte Hi2 ja luetaan sinne data2:n 8 merkittävintä bittiä
+       byte Lohmax = datahmax & 0x00FF; //alustetaan byte Lo2 ja luetaan sinne data2:n 8 vähitenmerkittävintä bittiä
+
+       //hmax Hi
+       while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+
+       EEAR = 0x05; //Asetetaan EEPROM:in osoitteksi 0x01.
+       EEDR = Hihmax; //Kirjoitetaan EEPROM:in datarekisteriin Hi2 byte.
+       EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+       EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä.
+
+       //hmax Lo
+       while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+
+       EEAR = 0x06; //Asetetaan EEPROM:in osoitteksi 0x02.
+       EEDR = Lohmax; ////Kirjoitetaan EEPROM:in datarekisteriin Lo2 byte.
+       EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+       EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä.
+      }
+
+      if (temperature >= tmax) //jos lämpötila on suurempi kuin tmax arvo
+      {
+        tmax = temperature; //tallenetaan tmax arvoksi temperature arvo
+        //Puretaan 16-bittinen lämpötila viesti kahdeksi 8-bitin tavuksi
+        //datatmax (tmax)
+        int datatmax =  tmax; //alustetaan muuttuja data2 ja annetaan sinne arvo tmax
+        byte Himax = datatmax >> 8; //alustetaan byte Hi2 ja luetaan sinne data2:n 8 merkittävintä bittiä
+        byte Lomax = datatmax & 0x00FF; //alustetaan byte Lo2 ja luetaan sinne data2:n 8 vähitenmerkittävintä bittiä
+
+        //Kirjoitetaan viestit EEPROM muistiin      
+      
+        //tmax Hi
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+
+        EEAR = 0x01; //Asetetaan EEPROM:in osoitteksi 0x01.
+        EEDR = Himax; //Kirjoitetaan EEPROM:in datarekisteriin Hi2 byte.
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä.
+
+        //tmax Lo
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+
+        EEAR = 0x02; //Asetetaan EEPROM:in osoitteksi 0x02.
+        EEDR = Lomax; ////Kirjoitetaan EEPROM:in datarekisteriin Lo2 byte.
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä.
+      }
+
+      if (temperature <= tmin) //jos lämpötila on pienempi kuin tmin arvo
+      {
+        tmin = temperature; //tallennetaan tmin arvoksi temperature arvo 
+        //Puretaan 16-bittinen lämpötila viesti kahdeksi 8-bitin tavuksi
+        //datatmin (tmin)
+        int datatmin = tmin; //alustetaan muuttuja data ja annetaan sinne arvo tmin     
+        byte Himin = datatmin >> 8; //alustetaan byte Hi ja luetaan sinne datan 8 merkittävintä bittiä
+        byte Lomin = datatmin & 0x00FF; //alustetaan byte Lo ja luetaan sinne datan 8 vähitenmerkittävintä bittiä
+
+        //Kirjoitetaan viestit EEPROM muistiin
+        
+        //tmin Hi
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+       
+        EEAR = 0x03; //Asetetaan EEPROM:in osoitteksi 0x06
+        EEDR = Himin; //kirjoitetaan EEPROM:in datarekisteriin Hi byte
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä 
+
+        //tmin Lo
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+    
+        EEAR = 0x04; //Asetetaan EEPROM:in osoitteksi 0x08
+        EEDR = Lomin; //Kirjoitetaan EEPROM:in datarekisteriin Lo byte
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä 
+
+      }
+
+      if (humidity <= hmin) //jos kosteusarvo on pienempi kuin hmin arvo
+      {
+        hmin = humidity; //tallennetaan hmin arvoksi humidity arvo
+        //Puretaan 16-bittinen kosteus viesti kahdeksi 8-bitin tavuksi
+        //datahmin (hmin)
+        int datahmin = hmin; //alustetaan muuttuja data ja annetaan sinne arvo tmin     
+        byte Hihmin = datahmin >> 8; //alustetaan byte Hi ja luetaan sinne datan 8 merkittävintä bittiä
+        byte Lohmin = datahmin & 0x00FF; //alustetaan byte Lo ja luetaan sinne datan 8 vähitenmerkittävintä bittiä    
+
+        //Kirjoitetaan viestit EEPROM muistiin
+      
+        //hmin Hi
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+       
+        EEAR = 0x07; //Asetetaan EEPROM:in osoitteksi 0x06
+        EEDR = Hihmin; //kirjoitetaan EEPROM:in datarekisteriin Hi byte
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä 
+
+        //hmin Lo
+        while(EECR & (1<<EEPE)); //tarkistetaan että EEPROM muisti on vapaa ja suorittanut edellisen kirjoituksen loppuun.
+    
+        EEAR = 0x08; //Asetetaan EEPROM:in osoitteksi 0x08
+        EEDR = Lohmin; //Kirjoitetaan EEPROM:in datarekisteriin Lo byte
+        EECR |= (1<<EEMPE); //Kirjoitetaan EECR rekisteriin bitti EEMPE arvoon 1, tällä asetetaan EEPROM kirjoitustilaan.
+        EECR |= (1<<EEPE); //Käynnistetään kirjoitus EECR rekisterin EEPE bitillä 
+      }
+      
+      //PWM ohjaus
+      
+      if (pwmon == 1) //If ehto pakko-ohjaukselle
+      {
+        pwmval = 255; //Jos pwmon on asetettu arvoon 1 ohjataan pwm asetettuun arvoon 0-255=0-100%
+      }
+     
+      else //Jos if ehto ei toteudu ohjataan puhallusta lämpötilalla
+      {
+      pwmval = map(temperature, 20,30,0,255); //Asetetaan PWM säädön parametrit lämpötilan mukaan 18-25 astetta ja säätö 0-100%
+      }
+      
+      TCCR1A=0x81; //Asetetaan TCCR1A rekisteristä pwm ohjaus 8bit phase correct moodiin
+      TCCR1B=0x04; //Asetetaan TCCR1B rekistetistä pwm ohjauksen kellotaajuuden jakaja (256)
+      OCR1A = pwmval; //Syötetään OCR1A rekistetrin kautta pwmval PWM ohjauksen arvoksi.
+      
+      //Näytön tulostus
+      
+      pwmpros = map(pwmval, 0,255,0,100); //Muunnetaan 8bit binäärinen arvo 0-255 prosenttiarvoksi 0-100%
+          
+      sprintf( cLine0Buffer,"Temp. %d*C FC:%d",temperature,pwmon); //Kirjoitetaan näytön ensimmäisen rivin buffer.
+      sprintf(cLine1Buffer,"Humid.%d%c  %d%c",humidity,37,pwmpros,37); //Kirjoitetaan näytön toisen rivin buffer.
+     
+      lcd.clear(); //tyhjennetään näyttö
+      lcd.print(cLine0Buffer); //Kirjoitetaan näytön ensimmäinen rivi
+      lcd.setCursor(0,1); //Siirretään kursori toisen rivin alkuun
+      lcd.print(cLine1Buffer); //Kirjoitetaan näytön toinen rivi
+      
+      delay(500); //0.5sek viive
+      break; //Keskeytys
+  
+ case 1: //mikäli selval on 1 niin näytetään max/min arvot
+
+      sprintf( cLine0Buffer,"Max %d*C, %d%c ",tmax,hmax,37); //Kirjoitetaan näytön ensimmäisen rivin buffer
+      sprintf(cLine1Buffer,"Min %d*C, %d%c ",tmin,hmin,37); //Kirjoitetaan näytön toisen rivin buffer.
+      
+      lcd.clear(); //tyhjennetään näyttö
+      lcd.print(cLine0Buffer); //Kirjoitetaan näytön ensimmäinen rivi
+      lcd.setCursor(0,1); //Siirretään kursori toisen rivin alkuun
+      lcd.print(cLine1Buffer); //Kirjoitetaan näytön toinen rivi
+
+      delay(3000); //Pysäytetään ruutu 3sek ajaksi
+      selval = 0; //Asetetaan selval arvoon 0
+      selval2 = 0; //Asetetaan selval2 arvoon 0
+      
+      break; //keskeytys
+  }   
+  
+}
